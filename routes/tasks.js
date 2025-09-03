@@ -6,19 +6,175 @@ const { authenticateToken } = require('../middleware/Auth');
 
 const router = express.Router();
 
-// Update project task counts
 const updateProjectTaskCounts = async (projectId) => {
-  const totalTasks = await Task.countDocuments({ project: projectId });
-  const completedTasks = await Task.countDocuments({ 
-    project: projectId, 
-    completed: true 
-  });
+  // Use aggregation to get both counts in ONE query instead of 3
+  const [result] = await Task.aggregate([
+    { $match: { project: projectId } },
+    {
+      $group: {
+        _id: null,
+        totalTasks: { $sum: 1 },
+        completedTasks: { $sum: { $cond: [{ $eq: ["$completed", true] }, 1, 0] } }
+      }
+    }
+  ]);
+
+  const counts = result || { totalTasks: 0, completedTasks: 0 };
 
   await Project.findByIdAndUpdate(projectId, {
-    tasksCount: totalTasks,
-    completedTasksCount: completedTasks
+    tasksCount: counts.totalTasks,
+    completedTasksCount: counts.completedTasks
   });
 };
+
+// OPTIMIZED Toggle task completion - Replace your existing route
+router.patch('/:id/toggle', authenticateToken, async (req, res) => {
+  try {
+    // Find and update in ONE query with projection to get only needed fields
+    const task = await Task.findById(req.params.id)
+      .select('completed status title project completedAt')
+      .populate('project', 'title owner');
+
+    if (!task) {
+      return res.status(404).json({
+        success: false,
+        message: 'Task not found'
+      });
+    }
+
+    // Check access
+    const hasAccess = task.project.owner.toString() === req.user._id.toString();
+    if (!hasAccess) {
+      return res.status(403).json({
+        success: false,
+        message: 'You do not have access to this task'
+      });
+    }
+
+    // Toggle completion and update in ONE query
+    const updatedTask = await Task.findByIdAndUpdate(
+      req.params.id,
+      {
+        completed: !task.completed,
+        status: !task.completed ? 'completed' : 'todo',
+        completedAt: !task.completed ? new Date() : null
+      },
+      { 
+        new: true,
+        select: 'title completed status completedAt project'
+      }
+    ).populate('assignedTo', 'name email')
+     .populate('createdBy', 'name email');
+
+    // Run these operations in parallel instead of sequential
+    await Promise.all([
+      updateProjectTaskCounts(task.project._id),
+      new ActivityFeed({
+        user: req.user._id,
+        projectId: task.project._id,
+        projectName: task.project.title,
+        taskId: updatedTask._id,
+        task: updatedTask.title,
+        type: updatedTask.completed ? 'task_completed' : 'task_reopened'
+      }).save()
+    ]);
+
+    res.json({
+      success: true,
+      message: `Task ${updatedTask.completed ? 'completed' : 'reopened'} successfully`,
+      task: updatedTask
+    });
+  } catch (error) {
+    console.error('Toggle task error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to toggle task completion',
+      error: error.message
+    });
+  }
+});
+
+// OPTIMIZED Create task - Replace your existing route
+router.post('/', authenticateToken, async (req, res) => {
+  try {
+    const { 
+      title, 
+      description, 
+      projectId, 
+      assignedTo, 
+      priority, 
+      dueDate, 
+      tags 
+    } = req.body;
+
+    if (!title || !projectId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Task title and project ID are required'
+      });
+    }
+
+    // Get project and last task order in parallel
+    const [project, lastTask] = await Promise.all([
+      Project.findOne({ _id: projectId, owner: req.user._id }).select('title'),
+      Task.findOne({ project: projectId }).sort({ order: -1 }).select('order')
+    ]);
+
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        message: 'Project not found or you do not have access'
+      });
+    }
+
+    const order = lastTask ? lastTask.order + 1 : 0;
+
+    const task = new Task({
+      title,
+      description,
+      project: projectId,
+      assignedTo: assignedTo || req.user._id,
+      createdBy: req.user._id,
+      priority,
+      dueDate,
+      tags,
+      order
+    });
+
+    // Save task and populate in one go
+    const savedTask = await task.save();
+    await savedTask.populate([
+      { path: 'assignedTo', select: 'name email' },
+      { path: 'createdBy', select: 'name email' }
+    ]);
+
+    // Run these operations in parallel
+    await Promise.all([
+      updateProjectTaskCounts(projectId),
+      new ActivityFeed({
+        user: req.user._id,
+        projectId: projectId,
+        projectName: project.title,
+        taskId: savedTask._id,
+        task: savedTask.title,
+        type: 'task_created'
+      }).save()
+    ]);
+
+    res.status(201).json({
+      success: true,
+      message: 'Task created successfully',
+      task: savedTask
+    });
+  } catch (error) {
+    console.error('Create task error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create task',
+      error: error.message
+    });
+  }
+})
 
 // Get all tasks for a project
 router.get('/project/:projectId', authenticateToken, async (req, res) => {
